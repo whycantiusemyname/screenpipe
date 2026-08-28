@@ -140,7 +140,11 @@ jobs:
         env:
           OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
         run: |
-          cargo test --release -p screenpipe-audio --lib -- backend_unavailable account_standing
+          $out = cargo test --release -p screenpipe-audio --lib -- backend_unavailable account_standing 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'test result: ok\. [1-9]\d* passed') {
+            throw "patch tests did not run or did not pass"
+          }
 
       - name: Create deployment package
         shell: pwsh

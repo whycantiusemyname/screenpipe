@@ -188,16 +188,24 @@ fn is_account_standing_error(error: &anyhow::Error) -> bool {
 /// mirror the set the openai-compatible client already treats as transient;
 /// status markers match its `API error (status {})` wording.
 fn is_backend_unavailable_error(error: &anyhow::Error) -> bool {
-    // Match on Debug: reqwest's Display omits the cause ("connection refused",
-    // "connection reset") which only appears in the error chain.
-    let message = format!("{error:?}").to_lowercase();
+    // Match on Display + Debug: reqwest's Display carries "error sending
+    // request" while Debug carries the cause chain — and on non-English
+    // Windows the OS cause text is localized (e.g. Chinese), so also match
+    // locale-independent markers: hyper's connect-phase wording and Windows
+    // socket error codes (10054 reset / 10060 timeout / 10061 refused).
+    let message = format!("{error} {error:?}").to_lowercase();
     let transport = message.contains("connection refused")
         || message.contains("connection reset")
         || message.contains("connection closed")
         || message.contains("broken pipe")
         || message.contains("error sending request")
         || message.contains("timed out")
-        || message.contains("timeout");
+        || message.contains("timeout")
+        || message.contains("tcp connect error")
+        || message.contains("client error (connect)")
+        || message.contains("os error 10054")
+        || message.contains("os error 10060")
+        || message.contains("os error 10061");
     let status = ["408", "429", "500", "502", "503", "504"]
         .iter()
         .any(|code| message.contains(&format!("api error (status {code})")));
@@ -1829,6 +1837,18 @@ mod tests {
         ))
         .context("error sending request for url (http://127.0.0.1:8080/v1/audio/transcriptions)");
         assert!(is_backend_unavailable_error(&refused));
+        // Non-English Windows regression: the OS cause text is localized and
+        // contains no English marker — only the socket error code and hyper's
+        // connect-phase wording are locale-independent. Chain mirrors the real
+        // reqwest -> hyper_util -> io error shape observed in the field.
+        let refused_zh = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "由于目标计算机积极拒绝，无法连接。 (os error 10061)",
+        ))
+        .context("tcp connect error")
+        .context("client error (Connect)")
+        .context("error sending request for url (http://127.0.0.1:8080/v1/audio/transcriptions)");
+        assert!(is_backend_unavailable_error(&refused_zh));
         assert!(is_backend_unavailable_error(&anyhow::anyhow!(
             "operation timed out"
         )));
