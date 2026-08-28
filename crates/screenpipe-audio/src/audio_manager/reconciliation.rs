@@ -183,6 +183,27 @@ fn is_account_standing_error(error: &anyhow::Error) -> bool {
     message.contains("account_not_in_good_standing") || message.contains("not in good standing")
 }
 
+/// True when the failure means the transcription endpoint is temporarily
+/// unreachable or overloaded, not that the audio is bad. Transport markers
+/// mirror the set the openai-compatible client already treats as transient;
+/// status markers match its `API error (status {})` wording.
+fn is_backend_unavailable_error(error: &anyhow::Error) -> bool {
+    // Match on Debug: reqwest's Display omits the cause ("connection refused",
+    // "connection reset") which only appears in the error chain.
+    let message = format!("{error:?}").to_lowercase();
+    let transport = message.contains("connection refused")
+        || message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("broken pipe")
+        || message.contains("error sending request")
+        || message.contains("timed out")
+        || message.contains("timeout");
+    let status = ["408", "429", "500", "502", "503", "504"]
+        .iter()
+        .any(|code| message.contains(&format!("api error (status {code})")));
+    transport || status
+}
+
 pub async fn reconcile_untranscribed(
     db: &DatabaseManager,
     transcription_engine: &TranscriptionEngine,
@@ -416,6 +437,18 @@ pub async fn reconcile_untranscribed(
                 if is_account_standing_error(&e) {
                     warn!(
                         "reconciliation: transcription API rejected this account; pausing sweep until the next cycle"
+                    );
+                    break;
+                }
+                // A backend that is merely down or overloaded (lazy-loaded
+                // local ASR servers, restarts, cold starts) is not bad data.
+                // Same treatment as the account-standing case: pause the sweep
+                // and leave chunks pending without consuming attempts, so an
+                // offline endpoint loses no backlog while it is unreachable.
+                if is_backend_unavailable_error(&e) {
+                    warn!(
+                        "reconciliation: transcription backend unavailable ({}); pausing sweep, chunks stay pending",
+                        e
                     );
                     break;
                 }
@@ -1783,6 +1816,34 @@ mod tests {
         )));
         assert!(!is_account_standing_error(&anyhow::anyhow!(
             "connection reset by peer"
+        )));
+    }
+
+    #[test]
+    fn backend_unavailable_errors_are_recognized_and_real_failures_are_not() {
+        // Transport failures surface as a wrapped error chain; the marker
+        // ("connection refused") only appears in Debug, not Display.
+        let refused = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused (os error 10061)",
+        ))
+        .context("error sending request for url (http://127.0.0.1:8080/v1/audio/transcriptions)");
+        assert!(is_backend_unavailable_error(&refused));
+        assert!(is_backend_unavailable_error(&anyhow::anyhow!(
+            "operation timed out"
+        )));
+        assert!(is_backend_unavailable_error(&anyhow::anyhow!(
+            "API error (status 503): {{\"detail\":\"model is not ready\"}}"
+        )));
+        assert!(is_backend_unavailable_error(&anyhow::anyhow!(
+            "API error (status 429): slow down"
+        )));
+        // Genuine content-level failures must keep consuming attempts.
+        assert!(!is_backend_unavailable_error(&anyhow::anyhow!(
+            "API error (status 400): unsupported audio format"
+        )));
+        assert!(!is_backend_unavailable_error(&anyhow::anyhow!(
+            "Failed to parse JSON response: expected value at line 1 column 1"
         )));
     }
 
