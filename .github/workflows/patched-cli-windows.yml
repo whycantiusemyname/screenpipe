@@ -12,6 +12,8 @@ name: Patched CLI Windows
 
 on:
   workflow_dispatch:
+  push:
+    branches: [patched-0.4.41]
 
 permissions:
   contents: read
