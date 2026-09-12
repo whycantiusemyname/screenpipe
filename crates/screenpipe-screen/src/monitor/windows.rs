@@ -4,12 +4,17 @@
 
 use super::{update_monitor_cache, MonitorData, MonitorListError, SafeMonitor, XcapMonitor};
 use anyhow::{Error, Result};
-use image::DynamicImage;
+use image::{DynamicImage, RgbaImage};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, SRCCOPY,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
 
 static RDP_CAPTURE_LOG_ONCE: Once = Once::new();
+static GDI_FALLBACK_LOG_ONCE: Once = Once::new();
 
 impl SafeMonitor {
     // Windows: Create from xcap monitor
@@ -213,19 +218,117 @@ impl SafeMonitor {
     }
 
     /// Per-frame xcap capture fallback (no index caching).
+    ///
+    /// Some virtual-display drivers expose a desktop that GDI can read but WGC cannot.
+    /// `xcap` uses WGC on Windows, so if both persistent WGC and xcap fail, use a
+    /// request-scoped GDI BitBlt as a final compatibility fallback.
     fn per_frame_capture(monitor_id: u32) -> Result<DynamicImage> {
         let monitors = XcapMonitor::all().map_err(Error::from)?;
         let monitor = monitors
             .iter()
             .find(|m| m.id().unwrap_or(0) == monitor_id)
             .ok_or_else(|| anyhow::anyhow!("Monitor not found"))?;
-        if monitor.width().unwrap_or(0) == 0 || monitor.height().unwrap_or(0) == 0 {
+        let width = monitor.width().unwrap_or(0);
+        let height = monitor.height().unwrap_or(0);
+        if width == 0 || height == 0 {
             return Err(anyhow::anyhow!("Invalid monitor dimensions"));
         }
-        monitor
-            .capture_image()
-            .map_err(Error::from)
-            .map(DynamicImage::ImageRgba8)
+
+        match monitor.capture_image() {
+            Ok(image) => Ok(DynamicImage::ImageRgba8(image)),
+            Err(xcap_error) => {
+                let x = monitor.x().unwrap_or(0);
+                let y = monitor.y().unwrap_or(0);
+                match Self::gdi_capture_region(x, y, width, height) {
+                    Ok(image) => {
+                        GDI_FALLBACK_LOG_ONCE.call_once(|| {
+                            tracing::warn!(
+                                "xcap/WGC capture failed; using GDI BitBlt compatibility fallback"
+                            );
+                        });
+                        Ok(image)
+                    }
+                    Err(gdi_error) => Err(anyhow::anyhow!(
+                        "xcap capture failed: {}; GDI fallback failed: {}",
+                        xcap_error,
+                        gdi_error
+                    )),
+                }
+            }
+        }
+    }
+
+    fn gdi_capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<DynamicImage> {
+        unsafe {
+            let screen: HDC = GetDC(None);
+            let mem = CreateCompatibleDC(screen);
+
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = width as i32;
+            info.bmiHeader.biHeight = -(height as i32);
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB.0;
+
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let dib: HBITMAP =
+                match CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(dib) => dib,
+                Err(error) => {
+                    let _ = DeleteDC(mem);
+                    ReleaseDC(None, screen);
+                    return Err(error.into());
+                }
+            };
+            let old = SelectObject(mem, dib);
+            let blt_result = BitBlt(
+                mem,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                screen,
+                x,
+                y,
+                SRCCOPY,
+            );
+
+            if let Err(error) = blt_result {
+                SelectObject(mem, old);
+                let _ = DeleteObject(dib);
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                return Err(error.into());
+            }
+
+            if bits.is_null() {
+                SelectObject(mem, old);
+                let _ = DeleteObject(dib);
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                return Err(anyhow::anyhow!(
+                    "GDI CreateDIBSection returned a null pixel buffer"
+                ));
+            }
+
+            let len = (width * height * 4) as usize;
+            let mut rgba = vec![0u8; len];
+            std::ptr::copy_nonoverlapping(bits as *const u8, rgba.as_mut_ptr(), len);
+
+            SelectObject(mem, old);
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+                pixel[3] = 255;
+            }
+            let image = RgbaImage::from_raw(width, height, rgba)
+                .ok_or_else(|| anyhow::anyhow!("invalid GDI image buffer dimensions"))?;
+            Ok(DynamicImage::ImageRgba8(image))
+        }
     }
 
     /// Refresh monitor metadata by re-enumerating all monitors.
