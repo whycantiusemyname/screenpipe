@@ -33,6 +33,22 @@ const RECONCILIATION_LOOKBACK_HOURS: i64 = 24 * 7;
 const RECONCILIATION_FRESHNESS_DELAY_SECS: i64 = 10 * 60;
 const RECONCILIATION_CHUNKS_PER_SWEEP: i64 = 50;
 
+const EXTERNAL_ASR_SCHEDULER_ENV: &str = "SCREENPIPE_EXTERNAL_ASR_SCHEDULER";
+
+fn external_asr_scheduler_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn external_asr_scheduler_enabled() -> bool {
+    let value = std::env::var(EXTERNAL_ASR_SCHEDULER_ENV).ok();
+    external_asr_scheduler_enabled_from(value.as_deref())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconciliationSweep {
     pub processed_chunks: usize,
@@ -229,9 +245,22 @@ pub async fn reconcile_untranscribed(
         return ReconciliationSweep::default();
     }
 
-    // Retry any previously failed transcriptions before processing new chunks
+    // Retry completed transcriptions whose DB write failed. This does not invoke
+    // ASR and remains safe when an external scheduler owns backlog transcription.
     if let Some(dir) = data_dir {
         retry_pending_transcriptions(db, dir, on_insert, metrics.as_ref()).await;
+    }
+
+    // Some deployments intentionally keep a remote/OpenAI-compatible ASR backend
+    // offline during active use and run it only from an external idle scheduler.
+    // Keep durable chunk/DB recovery above, but do not spend retries or hammer an
+    // intentionally offline backend here. Manual /audio/retranscribe remains the
+    // owner of backlog transcription in that mode.
+    if external_asr_scheduler_enabled() {
+        debug!(
+            "reconciliation: external ASR scheduler owns backlog transcription; skipping automatic ASR sweep"
+        );
+        return ReconciliationSweep::default();
     }
 
     let now = chrono::Utc::now();
@@ -1755,6 +1784,17 @@ fn extract_device_from_path(file_path: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_asr_scheduler_flag_parser_is_explicit() {
+        for enabled in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(external_asr_scheduler_enabled_from(Some(enabled)));
+        }
+        for disabled in ["0", "false", "off", "", "garbage"] {
+            assert!(!external_asr_scheduler_enabled_from(Some(disabled)));
+        }
+        assert!(!external_asr_scheduler_enabled_from(None));
+    }
 
     // ── pending-chunk durable recovery (SCREENPIPE-CLI-RC) ──────────────────
 
