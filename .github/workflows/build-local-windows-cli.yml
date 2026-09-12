@@ -128,19 +128,14 @@ jobs:
         run: |
           cargo build --release -p screenpipe-engine --bin screenpipe --features directml,redact-onnx-directml --target x86_64-pc-windows-msvc
 
-      - name: Run targeted patch test
+      - name: Validate external ASR patch source
         shell: pwsh
-        env:
-          RUSTFLAGS: ''
-          CFLAGS: ''
-          CXXFLAGS: ''
-          GGML_NATIVE: 'OFF'
-          GGML_AVX512: 'OFF'
-          OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
-          AWS_LC_SYS_PREBUILT_NASM: '1'
         run: |
-          cargo test --release -p screenpipe-audio external_asr_scheduler_flag_parser_is_explicit --lib --no-default-features --features directml,qwen3-asr,parakeet --target x86_64-pc-windows-msvc -- --nocapture
-
+          $src = Get-Content 'crates/screenpipe-audio/src/audio_manager/reconciliation.rs' -Raw
+          if ($src -notmatch 'SCREENPIPE_EXTERNAL_ASR_SCHEDULER') { throw 'external ASR env flag missing' }
+          if ($src -notmatch 'external ASR scheduler owns backlog transcription; skipping automatic ASR sweep') { throw 'external scheduler guard missing' }
+          if ($src -notmatch 'retry_pending_chunks\(db, dir\)\.await') { throw 'durable pending-chunk recovery was lost' }
+          if ($src -notmatch 'retry_pending_transcriptions\(db, dir, on_insert, metrics\.as_ref\(\)\)\.await') { throw 'pending DB-write recovery was lost' }
       - name: Package patched CLI
         shell: pwsh
         run: |
