@@ -394,6 +394,17 @@ pub(crate) async fn run_output_follow_sweep(
     use screenpipe_events::AudioCaptureHealthEvent;
     use tracing::{info, warn};
 
+    // In manual-device mode with meeting detection disabled, neither the endpoint
+    // follower nor the speaker watchdog can take any action. Avoid polling all
+    // Windows render endpoints every 2s in that configuration. Besides being
+    // wasted work, repeated WASAPI/session enumeration can grow audiodg handles
+    // on some drivers even when the configured capture stream itself is healthy.
+    let follow_enabled = audio_manager.use_system_default_audio().await;
+    let detector = audio_manager.meeting_detector().await;
+    if !follow_enabled && detector.is_none() {
+        return;
+    }
+
     let now = Instant::now();
     let samples = sample_render_endpoints();
 
@@ -408,7 +419,7 @@ pub(crate) async fn run_output_follow_sweep(
 
     // ── 1. Follow the audio (only when following system defaults — in
     //       manual mode the user picked their devices on purpose).
-    if audio_manager.use_system_default_audio().await {
+    if follow_enabled {
         let actions = follow.decide(&samples, &enrolled, &running_outputs, &user_disabled, now);
         for action in actions {
             match action {
@@ -445,7 +456,7 @@ pub(crate) async fn run_output_follow_sweep(
     }
 
     // ── 2. In-meeting speaker watchdog.
-    let Some(detector) = audio_manager.meeting_detector().await else {
+    let Some(detector) = detector else {
         return; // no meeting signal (e.g. engine-less CLI) — nothing to watch
     };
     let inputs = WatchdogInputs {
