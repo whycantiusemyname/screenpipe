@@ -680,7 +680,10 @@ pub async fn invalidate_device_cache() {
 /// in the settings dropdown and can pick it, only to silently get no
 /// audio. Strict-empty signal — we don't blocklist by name — so it stays
 /// safe across hardware revisions and locales.
-#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", feature = "pulseaudio"))
+))]
 fn has_usable_input_configs(device: &cpal::Device) -> bool {
     match device.supported_input_configs() {
         Ok(mut configs) => configs.next().is_some(),
@@ -691,7 +694,10 @@ fn has_usable_input_configs(device: &cpal::Device) -> bool {
 /// Output counterpart of [`has_usable_input_configs`]. Same failure
 /// modes apply to output devices on Windows — e.g. unrouted virtual
 /// monitor audio endpoints registered by a discrete-GPU driver.
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "pulseaudio"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(any(target_os = "macos", all(target_os = "linux", feature = "pulseaudio")))
+))]
 fn has_usable_output_configs(device: &cpal::Device) -> bool {
     match device.supported_output_configs() {
         Ok(mut configs) => configs.next().is_some(),
@@ -716,7 +722,21 @@ async fn list_audio_devices_uncached() -> Result<Vec<AudioDevice>> {
         return super::pulse::list_pulse_devices();
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+    #[cfg(target_os = "windows")]
+    {
+        // Avoid cpal capability probes during inventory refresh on Windows.
+        // supported_*_configs activates WASAPI clients in audiodg; on affected
+        // systems those server-side handles survive the probe, so the 30s
+        // device-cache refresh leaks a fixed batch forever. Enumerating ACTIVE
+        // MMDevice endpoints by friendly name is enough for discovery; the
+        // actual recording open still validates formats when a device is used.
+        return unsafe { windows_com_audio::list_active_audio_devices() };
+    }
+
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(all(target_os = "linux", feature = "pulseaudio"))
+    ))]
     {
         let host = cpal::default_host();
         let mut devices = Vec::new();
@@ -1267,6 +1287,44 @@ mod windows_com_audio {
             return Err(anyhow!("device friendly name is empty"));
         }
         Ok(name)
+    }
+
+    /// Enumerate ACTIVE Windows audio endpoints without activating an audio
+    /// client for each device. This is used by the periodic device inventory:
+    /// capability probing through cpal::supported_*_configs can leave a batch
+    /// of server-side audiodg handles behind on every refresh.
+    pub unsafe fn list_active_audio_devices() -> Result<Vec<super::AudioDevice>> {
+        use windows::Win32::Media::Audio::{
+            eCapture, eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        };
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+        let _com = ComApartment::enter();
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let mut out = Vec::new();
+
+        let captures = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        for i in 0..captures.GetCount()? {
+            let Ok(device) = captures.Item(i) else {
+                continue;
+            };
+            if let Ok(name) = endpoint_friendly_name(&device) {
+                out.push(super::AudioDevice::new(name, super::DeviceType::Input));
+            }
+        }
+
+        let renders = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        for i in 0..renders.GetCount()? {
+            let Ok(device) = renders.Item(i) else {
+                continue;
+            };
+            if let Ok(name) = endpoint_friendly_name(&device) {
+                out.push(super::AudioDevice::new(name, super::DeviceType::Output));
+            }
+        }
+
+        Ok(out)
     }
 
     fn pnp_instance_id_is_bluetooth(instance_id: &str) -> bool {
