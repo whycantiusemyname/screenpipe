@@ -13,10 +13,18 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Initialize CI log directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logDir = Join-Path $env:RUNNER_TEMP 'screenpipe-windows-ci'
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          "SCREENPIPE_CI_LOG_DIR=$logDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -31,10 +39,12 @@ jobs:
       - name: Install 7zip
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $7zip = 'C:\Program Files\7-Zip\7z.exe'
           if (-not (Test-Path $7zip)) {
             Invoke-WebRequest https://7-zip.org/a/7z2301-x64.exe -OutFile 7z-installer.exe
-            Start-Process -FilePath .\7z-installer.exe -Args '/S' -Wait
+            $installer = Start-Process -FilePath .\7z-installer.exe -Args '/S' -Wait -PassThru
+            if ($installer.ExitCode -ne 0) { throw "7-Zip installer failed (exit $($installer.ExitCode))" }
           }
           'C:\Program Files\7-Zip' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
@@ -46,17 +56,34 @@ jobs:
             ~/.cargo/git/db/
           key: local-win-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - uses: actions/cache@v4
+        with:
+          path: 'C:\t\x86_64-pc-windows-msvc\release'
+          key: local-win-release-x86_64-pc-windows-msvc-${{ hashFiles('**/Cargo.lock', '.github/workflows/build-local-windows-cli.yml') }}
+          restore-keys: |
+            local-win-release-x86_64-pc-windows-msvc-
+
       - name: Download ONNX Runtime
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $version = '1.24.2'
           $dmlVersion = '1.15.4'
-          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-$version"
-          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          $workspaceRoot = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\'
+          $extractRelative = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-$version"
+          $extractDir = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE $extractRelative))
+          if (-not $extractDir.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to prepare ONNX Runtime outside the workspace: $extractDir"
+          }
+          if (Test-Path -LiteralPath $extractDir) {
+            throw "Expected a fresh ONNX Runtime directory; refusing recursive cleanup: $extractDir"
+          }
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/$version" -OutFile ort-dml.zip
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/$dmlVersion" -OutFile directml.zip
-          7z x ort-dml.zip -oort-dml -y
-          7z x directml.zip -odirectml -y
+          & 7z x ort-dml.zip -oort-dml -y
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed extracting ONNX Runtime (exit $LASTEXITCODE)" }
+          & 7z x directml.zip -odirectml -y
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed extracting DirectML (exit $LASTEXITCODE)" }
           New-Item -ItemType Directory -Force -Path "$extractDir/lib" | Out-Null
           Copy-Item "ort-dml/runtimes/win-x64/native/onnxruntime.dll" "$extractDir/lib/"
           Copy-Item "ort-dml/runtimes/win-x64/native/onnxruntime.lib" "$extractDir/lib/"
@@ -83,18 +110,39 @@ jobs:
       - name: Setup OpenBLAS
         shell: pwsh
         run: |
-          cd apps/screenpipe-app-tauri
+          $ErrorActionPreference = 'Stop'
+          Set-Location apps/screenpipe-app-tauri
           bun scripts/setup_openblas.js
+          if ($LASTEXITCODE -ne 0) { throw "OpenBLAS setup failed (exit $LASTEXITCODE)" }
           "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Shorten target dir
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $workspaceRoot = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\'
+          $targetPath = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'target'))
+          if (-not $targetPath.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to prepare a Cargo target outside the workspace: $targetPath"
+          }
+          if (Test-Path -LiteralPath $targetPath) {
+            throw "Expected a fresh checkout without target; refusing recursive cleanup: $targetPath"
+          }
           $shortDir = 'C:\t'
-          if (Test-Path $shortDir) { Remove-Item -Recurse -Force $shortDir }
-          New-Item -ItemType Directory -Force -Path $shortDir | Out-Null
-          if (Test-Path target) { Remove-Item -Recurse -Force target }
-          cmd /c mklink /J target $shortDir
+          if ([System.IO.Path]::GetFullPath($shortDir) -ne 'C:\t') {
+            throw "Unexpected Cargo cache location: $shortDir"
+          }
+          if (Test-Path -LiteralPath $shortDir) {
+            $shortDirItem = Get-Item -LiteralPath $shortDir -Force
+            if (-not $shortDirItem.PSIsContainer) { throw "Cargo target path is not a directory: $shortDir" }
+            if ($shortDirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+              throw "Refusing to use a reparse point as the Cargo cache directory: $shortDir"
+            }
+          } else {
+            New-Item -ItemType Directory -Path $shortDir | Out-Null
+          }
+          & cmd.exe /c mklink /J target C:\t
+          if ($LASTEXITCODE -ne 0) { throw "Failed creating Cargo target junction (exit $LASTEXITCODE)" }
 
       - name: Build patched CLI
         shell: pwsh
@@ -118,25 +166,137 @@ jobs:
           OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
           AWS_LC_SYS_PREBUILT_NASM: '1'
         run: |
-          cargo build --release -p screenpipe-engine --bin screenpipe --features directml,redact-onnx-directml --target x86_64-pc-windows-msvc
+          $ErrorActionPreference = 'Stop'
+          $logPath = Join-Path $env:SCREENPIPE_CI_LOG_DIR 'build.log'
+          $cargoArgs = @('build', '--release', '-p', 'screenpipe-engine', '--bin', 'screenpipe', '--features', 'directml,redact-onnx-directml', '--target', 'x86_64-pc-windows-msvc')
+          "cargo $($cargoArgs -join ' ')" | Out-File -FilePath $logPath -Encoding utf8
+          & cargo @cargoArgs 2>&1 | Tee-Object -FilePath $logPath -Append
+          $cargoExitCode = $LASTEXITCODE
+          if ($cargoExitCode -ne 0) { throw "Patched CLI build failed (cargo exit $cargoExitCode)" }
 
-      - name: Run targeted patch test
+      - name: Run targeted audio and OCR regression tests
         shell: pwsh
         env:
           RUSTFLAGS: ''
           CFLAGS: ''
           CXXFLAGS: ''
           GGML_NATIVE: 'OFF'
+          GGML_SSE42: 'ON'
+          GGML_AVX: 'ON'
+          GGML_AVX2: 'ON'
+          GGML_BMI2: 'ON'
           GGML_AVX512: 'OFF'
+          GGML_AVX512_VBMI: 'OFF'
+          GGML_AVX512_VNNI: 'OFF'
+          GGML_AVX512_BF16: 'OFF'
+          CMAKE_ARGS: '-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF'
           OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
           AWS_LC_SYS_PREBUILT_NASM: '1'
         run: |
-          cargo test --release -p screenpipe-audio external_asr_scheduler_flag_parser_is_explicit --lib --no-default-features --features directml,qwen3-asr,parakeet --target x86_64-pc-windows-msvc -- --nocapture
+          $ErrorActionPreference = 'Stop'
+          $testLogPath = Join-Path $env:SCREENPIPE_CI_LOG_DIR 'targeted-tests.log'
+          $runnerLogPath = Join-Path $env:SCREENPIPE_CI_LOG_DIR 'runner-ocr-capabilities.txt'
+          $script:targetedTestFailures = [System.Collections.Generic.List[string]]::new()
+          $os = Get-CimInstance Win32_OperatingSystem
+          "OS: $($os.Caption) ($($os.Version))" | Out-File -FilePath $runnerLogPath -Encoding utf8
+          $fixturePath = Join-Path $env:GITHUB_WORKSPACE 'crates/screenpipe-screen/tests/testing_OCR.png'
+          if (-not (Test-Path -LiteralPath $fixturePath)) { throw "Required Windows OCR fixture is missing: $fixturePath" }
+          try {
+            $ocrCapabilities = @(Get-WindowsCapability -Online -ErrorAction Stop | Where-Object { $_.Name -like 'Language.OCR~~~*' })
+            $englishOcr = @($ocrCapabilities | Where-Object { $_.Name -eq 'Language.OCR~~~en-US~0.0.1.0' })
+            if ($englishOcr.Count -eq 0) {
+              $message = 'Windows Server does not report the required Language.OCR~~~en-US~0.0.1.0 capability.'
+              $message | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+              $script:targetedTestFailures.Add($message)
+            } elseif ($englishOcr[0].State -ne 'Installed') {
+              "Installing required OCR language capability (state: $($englishOcr[0].State))." | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+              try {
+                Add-WindowsCapability -Online -Name 'Language.OCR~~~en-US~0.0.1.0' -ErrorAction Stop | Out-String | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+                $ocrCapabilities = @(Get-WindowsCapability -Online -ErrorAction Stop | Where-Object { $_.Name -like 'Language.OCR~~~*' })
+                $englishOcr = @($ocrCapabilities | Where-Object { $_.Name -eq 'Language.OCR~~~en-US~0.0.1.0' })
+                if ($englishOcr.Count -eq 0 -or $englishOcr[0].State -ne 'Installed') {
+                  $message = 'The Windows en-US OCR language capability was not installed; native OCR fixture tests will report their own results.'
+                  $message | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+                  $script:targetedTestFailures.Add($message)
+                }
+              } catch {
+                $message = "Could not install the Windows en-US OCR language capability: $($_.Exception.Message)"
+                $message | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+                $script:targetedTestFailures.Add($message)
+              }
+            }
+            if ($ocrCapabilities.Count -eq 0) {
+              'No Language.OCR capabilities were reported by Get-WindowsCapability.' | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+            } else {
+              $ocrCapabilities | Format-Table Name, State -AutoSize | Out-String | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+            }
+          } catch {
+            "Get-WindowsCapability diagnostic unavailable: $($_.Exception.Message)" | Add-Content -LiteralPath $runnerLogPath -Encoding utf8
+          }
+          Get-Content -LiteralPath $runnerLogPath
+
+          function Invoke-LoggedCargoTest {
+            param(
+              [Parameter(Mandatory)][string]$Name,
+              [Parameter(Mandatory)][string[]]$CargoArguments,
+              [Parameter(Mandatory)][int]$ExpectedTestCount
+            )
+
+            $command = "cargo $($CargoArguments -join ' ')"
+            "=== $Name ===" | Add-Content -LiteralPath $testLogPath -Encoding utf8
+            $command | Add-Content -LiteralPath $testLogPath -Encoding utf8
+            Write-Host "Running $command"
+            $capturedOutput = @()
+            & cargo @CargoArguments 2>&1 | Tee-Object -FilePath $testLogPath -Append -Variable capturedOutput
+            $cargoExitCode = $LASTEXITCODE
+            $outputText = (@($capturedOutput) | ForEach-Object { $_.ToString() }) -join "`n"
+            $runningPattern = "(?m)^running\s+$ExpectedTestCount\s+tests?\b"
+            if ($cargoExitCode -ne 0) {
+              $script:targetedTestFailures.Add("$Name failed (cargo exit $cargoExitCode)")
+              Write-Host "$Name failed (cargo exit $cargoExitCode); continuing so remaining regressions still run."
+            }
+            if ($outputText -notmatch $runningPattern) {
+              $script:targetedTestFailures.Add("$Name did not run the expected $ExpectedTestCount test(s); refusing a zero-test pass")
+              Write-Host "$Name did not run the expected $ExpectedTestCount test(s); continuing so remaining regressions still run."
+            }
+          }
+
+          $target = 'x86_64-pc-windows-msvc'
+          $audioFeatures = 'directml,qwen3-asr,parakeet'
+          $testCases = @(
+            [pscustomobject]@{ Name = 'audio-device-manager-published-stream'; Package = 'screenpipe-audio'; TargetArgs = @('--lib'); Features = $audioFeatures; Filter = 'published_stream_is_not_reopened_before_recording_handle_registration'; ExpectedTests = 1 },
+            [pscustomobject]@{ Name = 'audio-device-manager-cancelled-transition'; Package = 'screenpipe-audio'; TargetArgs = @('--lib'); Features = $audioFeatures; Filter = 'cancelled_request_keeps_device_owned_until_transition_finishes'; ExpectedTests = 1 },
+            [pscustomobject]@{ Name = 'audio-device-manager-global-stop'; Package = 'screenpipe-audio'; TargetArgs = @('--lib'); Features = $audioFeatures; Filter = 'global_stop_waits_for_startup_before_removing_the_stream'; ExpectedTests = 1 },
+            [pscustomobject]@{ Name = 'audio-stream-teardown-timeout'; Package = 'screenpipe-audio'; TargetArgs = @('--lib'); Features = $audioFeatures; Filter = 'teardown_timeout_retains_native_worker_and_allows_later_cleanup'; ExpectedTests = 1 },
+            [pscustomobject]@{ Name = 'audio-existing-external-asr-scheduler-flag'; Package = 'screenpipe-audio'; TargetArgs = @('--lib'); Features = $audioFeatures; Filter = 'external_asr_scheduler_flag_parser_is_explicit'; ExpectedTests = 1 },
+            [pscustomobject]@{ Name = 'ocr-worker-portable-lifecycle'; Package = 'screenpipe-screen'; TargetArgs = @('--lib'); Features = $null; Filter = 'ocr_worker::tests'; ExpectedTests = 3 },
+            [pscustomobject]@{ Name = 'ocr-public-api-native-lifecycle'; Package = 'screenpipe-screen'; TargetArgs = @('--lib'); Features = $null; Filter = 'request_lifecycle_tests'; ExpectedTests = 6 },
+            [pscustomobject]@{ Name = 'windows-ocr-apartment-regression'; Package = 'screenpipe-screen'; TargetArgs = @('--test', 'windows_vision_test'); Features = $null; Filter = 'apartment_regression'; ExpectedTests = 2 }
+          )
+          $testManifestEntries = @()
+          foreach ($testCase in $testCases) {
+            $cargoArguments = @('test', '--release', '-p', $testCase.Package) + @($testCase.TargetArgs) + @('--no-default-features', '--target', $target)
+            if ($testCase.Features) { $cargoArguments += @('--features', $testCase.Features) }
+            $cargoArguments += @($testCase.Filter, '--', '--nocapture')
+            $testManifestEntries += [pscustomobject]@{
+              name = $testCase.Name
+              command = "cargo $($cargoArguments -join ' ')"
+              expected_test_count = $testCase.ExpectedTests
+            }
+            Invoke-LoggedCargoTest -Name $testCase.Name -CargoArguments $cargoArguments -ExpectedTestCount $testCase.ExpectedTests
+          }
+          [ordered]@{ tests = $testManifestEntries } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $env:SCREENPIPE_CI_LOG_DIR 'test-commands.json') -Encoding utf8
+          if ($script:targetedTestFailures.Count -gt 0) {
+            $failureSummary = $script:targetedTestFailures -join "`n"
+            "FAILURES:`n$failureSummary" | Add-Content -LiteralPath $testLogPath -Encoding utf8
+            throw "One or more targeted regressions failed or did not run the expected test count:`n$failureSummary"
+          }
 
       - name: Package patched CLI
         shell: pwsh
         run: |
-          $packageDir = 'screenpipe-0.4.50-external-asr-x86_64-pc-windows-msvc'
+          $ErrorActionPreference = 'Stop'
+          $packageDir = 'screenpipe-0.4.50-audio-ocr-lifecycle-fix-x86_64-pc-windows-msvc'
           New-Item -Path "$packageDir/bin" -ItemType Directory -Force | Out-Null
           Copy-Item 'target/x86_64-pc-windows-msvc/release/screenpipe.exe' "$packageDir/bin/"
           $ortDll = 'target/x86_64-pc-windows-msvc/release/onnxruntime.dll'
@@ -150,15 +310,48 @@ jobs:
           foreach ($dll in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','msvcp140_1.dll')) {
             Copy-Item "C:\Windows\System32\$dll" "$packageDir/bin/" -Force
           }
-          & "$packageDir/bin/screenpipe.exe" --version
+          $exePath = "$packageDir/bin/screenpipe.exe"
+          & $exePath --version
           if ($LASTEXITCODE -ne 0) { throw 'patched screenpipe.exe failed native launch sanity check' }
-          7z a "$packageDir.zip" "./$packageDir/*"
-          Get-FileHash "$packageDir.zip" -Algorithm SHA256 | Format-List
+          $exeSha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sourceSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $sourceSha) { throw 'Could not determine the checked-out source SHA' }
+          $testCommands = Get-Content -LiteralPath (Join-Path $env:SCREENPIPE_CI_LOG_DIR 'test-commands.json') -Raw | ConvertFrom-Json
+          $manifest = [ordered]@{
+            package_version = '0.4.50'
+            target = 'x86_64-pc-windows-msvc'
+            runner = 'windows-2022'
+            source_commit_sha = $sourceSha
+            upstream_patch_ids = @(
+              'fa4dbb0aa7b36eb901c7df7020992f16e2843e0d'
+              '7f677aa3dc5e1e9d601bc5de2f4a90a6002aeedc'
+            )
+            build_command = 'cargo build --release -p screenpipe-engine --bin screenpipe --features directml,redact-onnx-directml --target x86_64-pc-windows-msvc'
+            tests = @($testCommands.tests)
+            executable = [ordered]@{
+              path = 'bin/screenpipe.exe'
+              sha256 = $exeSha256
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$packageDir/build-manifest.json" -Encoding utf8
+          & 7z a "$packageDir.zip" "./$packageDir/*"
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip failed creating the CLI package (exit $LASTEXITCODE)" }
+          Get-FileHash -LiteralPath "$packageDir.zip" -Algorithm SHA256 | Format-List
+          Get-Content -LiteralPath "$packageDir/build-manifest.json"
 
       - name: Upload patched Windows CLI
         uses: actions/upload-artifact@v4
         with:
-          name: screenpipe-0.4.50-external-asr-windows
-          path: screenpipe-0.4.50-external-asr-x86_64-pc-windows-msvc.zip
+          name: screenpipe-0.4.50-audio-ocr-lifecycle-fix-windows-x86_64-pc-windows-msvc
+          path: screenpipe-0.4.50-audio-ocr-lifecycle-fix-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Windows CI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-0.4.50-audio-ocr-lifecycle-fix-windows-ci-logs
+          path: ${{ runner.temp }}/screenpipe-windows-ci/*
+          if-no-files-found: warn
           retention-days: 7
