@@ -56,7 +56,8 @@ jobs:
             ~/.cargo/git/db/
           key: local-win-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - uses: actions/cache@v4
+      - id: release-cache
+        uses: actions/cache/restore@v4
         with:
           path: 'C:\t\x86_64-pc-windows-msvc\release'
           key: local-win-release-x86_64-pc-windows-msvc-${{ hashFiles('**/Cargo.lock', '.github/workflows/build-local-windows-cli.yml') }}
@@ -145,6 +146,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed creating Cargo target junction (exit $LASTEXITCODE)" }
 
       - name: Build patched CLI
+        id: build-cli
         shell: pwsh
         env:
           CARGO_PROFILE_RELEASE_STRIP: 'none'
@@ -247,7 +249,7 @@ jobs:
             $command | Add-Content -LiteralPath $testLogPath -Encoding utf8
             Write-Host "Running $command"
             $capturedOutput = @()
-            & cargo @CargoArguments 2>&1 | Tee-Object -FilePath $testLogPath -Append -Variable capturedOutput
+            & cargo @CargoArguments 2>&1 | Tee-Object -Variable capturedOutput | Tee-Object -FilePath $testLogPath -Append
             $cargoExitCode = $LASTEXITCODE
             $outputText = (@($capturedOutput) | ForEach-Object { $_.ToString() }) -join "`n"
             $runningPattern = "(?m)^running\s+$ExpectedTestCount\s+tests?\b"
@@ -291,6 +293,13 @@ jobs:
             "FAILURES:`n$failureSummary" | Add-Content -LiteralPath $testLogPath -Encoding utf8
             throw "One or more targeted regressions failed or did not run the expected test count:`n$failureSummary"
           }
+
+      - name: Save release build cache
+        if: always() && steps.build-cli.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: 'C:\t\x86_64-pc-windows-msvc\release'
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
 
       - name: Package patched CLI
         shell: pwsh
