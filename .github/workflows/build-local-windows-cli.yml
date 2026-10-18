@@ -176,6 +176,65 @@ jobs:
           $cargoExitCode = $LASTEXITCODE
           if ($cargoExitCode -ne 0) { throw "Patched CLI build failed (cargo exit $cargoExitCode)" }
 
+      - name: Stage Windows runtime DLLs for regression tests
+        shell: pwsh
+        env:
+          OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetDeps = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release/deps'
+          New-Item -ItemType Directory -Force -Path $targetDeps | Out-Null
+
+          $ortLib = $env:ORT_LIB_LOCATION
+          $openblasBin = Join-Path $env:OPENBLAS_PATH 'bin'
+          foreach ($sourceDir in @($ortLib, $openblasBin)) {
+            if (-not $sourceDir -or -not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+              throw "Required native runtime directory is missing: $sourceDir"
+            }
+          }
+
+          $ortDlls = @(Get-ChildItem -LiteralPath $ortLib -Filter '*.dll' -File)
+          if (-not ($ortDlls.Name -contains 'onnxruntime.dll')) {
+            throw "onnxruntime.dll not found in $ortLib"
+          }
+          if (-not ($ortDlls.Name -contains 'DirectML.dll')) {
+            throw "DirectML.dll not found in $ortLib"
+          }
+          $openblasDlls = @(Get-ChildItem -LiteralPath $openblasBin -Filter '*.dll' -File)
+          if ($openblasDlls.Count -eq 0 -or -not ($openblasDlls.Name -contains 'libopenblas.dll' -or $openblasDlls.Name -contains 'openblas.dll')) {
+            throw "OpenBLAS runtime DLL not found in $openblasBin"
+          }
+
+          # Cargo places Windows test executables in release/deps. Copy next to
+          # them because the loader checks the executable directory before PATH.
+          # Copy every package DLL so transitive imports resolve as well.
+          foreach ($dll in @($ortDlls) + @($openblasDlls)) {
+            $destination = Join-Path $targetDeps $dll.Name
+            [System.IO.File]::Copy($dll.FullName, $destination, $true)
+            if ((Get-Item -LiteralPath $destination).Length -eq 0) {
+              throw "Staged runtime DLL is empty: $($dll.Name)"
+            }
+            Write-Host "Staged $($dll.Name) ($((Get-Item -LiteralPath $destination).Length) bytes)"
+          }
+
+          $crtSource = Join-Path $env:SystemRoot 'System32'
+          foreach ($crt in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+            $source = Join-Path $crtSource $crt
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Required VC++ runtime DLL not found on runner: $source"
+            }
+            $destination = Join-Path $targetDeps $crt
+            [System.IO.File]::Copy($source, $destination, $true)
+            if ((Get-Item -LiteralPath $destination).Length -eq 0) {
+              throw "Staged runtime DLL is empty: $crt"
+            }
+            Write-Host "Staged $crt ($((Get-Item -LiteralPath $destination).Length) bytes)"
+          }
+
+          $ortLib | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $openblasBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Get-ChildItem -LiteralPath $targetDeps -Filter '*.dll' | Select-Object Name, Length | Format-Table -AutoSize
+
       - name: Run targeted audio and OCR regression tests
         shell: pwsh
         env:
@@ -199,6 +258,7 @@ jobs:
           $testLogPath = Join-Path $env:SCREENPIPE_CI_LOG_DIR 'targeted-tests.log'
           $runnerLogPath = Join-Path $env:SCREENPIPE_CI_LOG_DIR 'runner-ocr-capabilities.txt'
           $script:targetedTestFailures = [System.Collections.Generic.List[string]]::new()
+          $script:audioDependencyDiagnosticWritten = $false
           $os = Get-CimInstance Win32_OperatingSystem
           "OS: $($os.Caption) ($($os.Version))" | Out-File -FilePath $runnerLogPath -Encoding utf8
           $fixturePath = Join-Path $env:GITHUB_WORKSPACE 'crates/screenpipe-screen/tests/testing_OCR.png'
@@ -252,6 +312,27 @@ jobs:
             & cargo @CargoArguments 2>&1 | Tee-Object -Variable capturedOutput | Tee-Object -FilePath $testLogPath -Append
             $cargoExitCode = $LASTEXITCODE
             $outputText = (@($capturedOutput) | ForEach-Object { $_.ToString() }) -join "`n"
+
+            if (-not $script:audioDependencyDiagnosticWritten -and $Name.StartsWith('audio-')) {
+              $script:audioDependencyDiagnosticWritten = $true
+              $exeMatch = [regex]::Match($outputText, '(?im)^\s*Running unittests .+ \((?<path>[^)\r\n]+\.exe)\)\s*$')
+              if ($exeMatch.Success) {
+                $testExe = Join-Path $env:GITHUB_WORKSPACE $exeMatch.Groups['path'].Value
+                $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+                if ($dumpbin -and (Test-Path -LiteralPath $testExe -PathType Leaf)) {
+                  "=== Audio test executable PE dependencies: $testExe ===" | Add-Content -LiteralPath $testLogPath -Encoding utf8
+                  & $dumpbin.Source /DEPENDENTS $testExe 2>&1 | Tee-Object -FilePath $testLogPath -Append
+                  if ($LASTEXITCODE -ne 0) {
+                    'dumpbin /DEPENDENTS failed; see runner toolchain diagnostics.' | Add-Content -LiteralPath $testLogPath -Encoding utf8
+                  }
+                } else {
+                  "dumpbin dependency diagnostic unavailable (dumpbin=$([bool]$dumpbin), test executable exists=$(Test-Path -LiteralPath $testExe -PathType Leaf)): $testExe" | Add-Content -LiteralPath $testLogPath -Encoding utf8
+                }
+              } else {
+                'dumpbin dependency diagnostic unavailable: Cargo output did not include the audio test executable path.' | Add-Content -LiteralPath $testLogPath -Encoding utf8
+              }
+            }
+
             $runningPattern = "(?m)^running\s+$ExpectedTestCount\s+tests?\b"
             if ($cargoExitCode -ne 0) {
               $script:targetedTestFailures.Add("$Name failed (cargo exit $cargoExitCode)")
